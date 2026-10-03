@@ -9,8 +9,10 @@ import type { Survey } from '../types/survey';
 import type { Planting } from '../types/planting';
 import type { Seedling } from '../types/seedling';
 import type { Replant } from '../types/replant';
+import type { Requisition } from '../types/requisition';
 import { RATE_LEVEL_LABEL } from '../types/survey';
 import { calcSurvivalRate, percentText, round1 } from './rate';
+import { effectivePlantedTotal } from './inventory';
 import { stampSuffix } from './id';
 
 /** 触发浏览器下载 */
@@ -67,11 +69,15 @@ export function parseSnapshot(text: string): SnapshotParseResult {
       snapshot: null,
     };
   }
-  const collections: Array<keyof DatabaseSnapshot> = ['plots', 'seedlings', 'plantings', 'surveys', 'replants'];
-  for (const key of collections) {
+  const requiredCollections: Array<keyof DatabaseSnapshot> = ['plots', 'seedlings', 'plantings', 'surveys', 'replants'];
+  for (const key of requiredCollections) {
     if (!Array.isArray(data[key])) {
       return { ok: false, message: `存档缺少 ${String(key)} 数组。`, snapshot: null };
     }
+  }
+  // v2 及更早存档没有领用登记：导入时由 db.importSnapshot 按历史栽植 / 补植回填
+  if (data.requisitions !== undefined && !Array.isArray(data.requisitions)) {
+    return { ok: false, message: '存档的 requisitions 字段必须是数组。', snapshot: null };
   }
   return { ok: true, message: '存档校验通过。', snapshot: data as DatabaseSnapshot };
 }
@@ -83,6 +89,7 @@ export function exportSummaryCsv(
   plantings: Planting[],
   surveys: Survey[],
   replants: Replant[],
+  requisitions: Requisition[] = [],
 ): string {
   const header = [
     '地块名',
@@ -93,11 +100,15 @@ export function exportSummaryCsv(
     '状态',
     '苗木批次数',
     '进场苗木合计(株)',
-    '栽植总株数(株)',
+    '累计退货(株)',
+    '账面栽植总株数(株)',
+    '有效栽植总株数(株)',
+    '挂起领用(笔)',
     '测次数',
     '最新测次',
     '最新成活株数',
     '最新成活率(%)',
+    '定稿状态',
     '判定等级',
     '平均株高(cm)',
     '缺株数(株)',
@@ -110,9 +121,15 @@ export function exportSummaryCsv(
     const plotPlantings = plantings.filter((row) => row.plotId === plot.id);
     const plotSurveys = surveys.filter((row) => row.plotId === plot.id).sort((a, b) => a.round - b.round);
     const plotReplants = replants.filter((row) => row.plotId === plot.id);
-    const total = plotPlantings.reduce((acc, row) => acc + row.count, 0);
+    const bookTotal = plotPlantings.reduce((acc, row) => acc + row.count, 0);
+    const effectiveTotal = effectivePlantedTotal(plot.id, plotPlantings, requisitions);
+    const pendingCount = requisitions.filter((row) => row.plotId === plot.id && row.status === '挂起').length;
     const latest = plotSurveys.length > 0 ? plotSurveys[plotSurveys.length - 1] : null;
-    const rate = latest ? calcSurvivalRate(latest.aliveCount, total) : 0;
+    const rate = latest
+      ? latest.finalized
+        ? latest.finalizedRate
+        : calcSurvivalRate(latest.aliveCount, effectiveTotal)
+      : 0;
     lines.push(
       [
         plot.name,
@@ -123,11 +140,15 @@ export function exportSummaryCsv(
         plot.state,
         plotSeedlings.length,
         plotSeedlings.reduce((acc, row) => acc + row.quantity, 0),
-        total,
+        plotSeedlings.reduce((acc, row) => acc + (row.returnedQuantity ?? 0), 0),
+        bookTotal,
+        effectiveTotal,
+        pendingCount,
         plotSurveys.length,
         latest ? `第 ${latest.round} 测次` : '未验收',
         latest ? latest.aliveCount : 0,
         round1(rate),
+        latest ? (latest.finalized ? (latest.pendingReconfirm ? '定稿待复认' : '已定稿') : '未定稿') : '—',
         latest ? RATE_LEVEL_LABEL[latest.grade] : '—',
         latest ? latest.avgHeightCm : 0,
         plot.missingCount,
@@ -148,9 +169,14 @@ export function exportSummaryCsvFile(
   plantings: Planting[],
   surveys: Survey[],
   replants: Replant[],
+  requisitions: Requisition[] = [],
 ): string {
   const filename = `红树林成活率汇总-${stampSuffix()}.csv`;
-  download(filename, exportSummaryCsv(plots, seedlings, plantings, surveys, replants), 'text/csv;charset=utf-8');
+  download(
+    filename,
+    exportSummaryCsv(plots, seedlings, plantings, surveys, replants, requisitions),
+    'text/csv;charset=utf-8',
+  );
   return filename;
 }
 

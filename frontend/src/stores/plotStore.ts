@@ -9,6 +9,7 @@ import type { Plot, PlotDraft, Substrate, TideZone } from '../types/plot';
 import type { Seedling } from '../types/seedling';
 import type { Planting } from '../types/planting';
 import type { Survey, RateLevel } from '../types/survey';
+import type { Requisition } from '../types/requisition';
 import {
   DB_SCHEMA_VERSION,
   ROW_REVISION,
@@ -35,10 +36,16 @@ export interface PlotStat {
   seedlingCount: number;
   /** 进场苗木合计（株） */
   seedlingQuantity: number;
-  /** 栽植总株数（株） */
+  /** 批次累计退货（株） */
+  returnedQuantity: number;
+  /** 有效栽植总株数（株，仅已扣减领用计入） */
   plantTotal: number;
+  /** 挂起领用株数（株，扣不下待人工处理） */
+  pendingRequisitionCount: number;
   /** 验收测次数 */
   surveyCount: number;
+  /** 等待复认的定稿测次数 */
+  pendingReconfirmCount: number;
   /** 最新成活率（%） */
   latestRate: number;
   /** 最新等级 */
@@ -74,6 +81,7 @@ interface PlotStoreState {
   seedlings: Seedling[];
   plantings: Planting[];
   surveys: Survey[];
+  requisitions: Requisition[];
   currentPlotId: string | null;
   loading: boolean;
   ready: boolean;
@@ -99,8 +107,11 @@ interface PlotStoreState {
 const EMPTY_STAT: Omit<PlotStat, 'plotId'> = {
   seedlingCount: 0,
   seedlingQuantity: 0,
+  returnedQuantity: 0,
   plantTotal: 0,
+  pendingRequisitionCount: 0,
   surveyCount: 0,
+  pendingReconfirmCount: 0,
   latestRate: 0,
   level: 'poor',
   trend: 0,
@@ -114,6 +125,7 @@ export const usePlotStore = create<PlotStoreState>((set, get) => ({
   seedlings: [],
   plantings: [],
   surveys: [],
+  requisitions: [],
   currentPlotId: readCurrentPlotId(),
   loading: true,
   ready: false,
@@ -130,27 +142,33 @@ export const usePlotStore = create<PlotStoreState>((set, get) => ({
       if (!subscribed) {
         subscribed = true;
         liveQuery(async () => {
-          const [plots, seedlings, plantings, surveys] = await Promise.all([
+          const [plots, seedlings, plantings, surveys, requisitions] = await Promise.all([
             db.plots.toArray(),
             db.seedlings.toArray(),
             db.plantings.toArray(),
             db.surveys.toArray(),
+            db.requisitions.toArray(),
           ]);
-          return { plots, seedlings, plantings, surveys };
+          return { plots, seedlings, plantings, surveys, requisitions };
         }).subscribe({
-          next: ({ plots, seedlings, plantings, surveys }) => {
+          next: ({ plots, seedlings, plantings, surveys, requisitions }) => {
             const stats: Record<string, PlotStat> = {};
             const summaries: Record<string, SurvivalSummary> = {};
             plots.forEach((plot) => {
               const plotSeedlings = seedlings.filter((row) => row.plotId === plot.id);
-              const summary = buildSurvivalSummary(plot.id, surveys, plantings);
+              const summary = buildSurvivalSummary(plot.id, surveys, plantings, undefined, requisitions);
               summaries[plot.id] = summary;
               stats[plot.id] = {
                 plotId: plot.id,
                 seedlingCount: plotSeedlings.length,
                 seedlingQuantity: plotSeedlings.reduce((acc, row) => acc + row.quantity, 0),
+                returnedQuantity: plotSeedlings.reduce((acc, row) => acc + row.returnedQuantity, 0),
                 plantTotal: summary.totalCount,
+                pendingRequisitionCount: requisitions.filter(
+                  (row) => row.plotId === plot.id && row.status === '挂起',
+                ).length,
                 surveyCount: summary.points.length,
+                pendingReconfirmCount: summary.pendingReconfirmCount,
                 latestRate: summary.latestRate,
                 level: summary.level,
                 trend: summary.trend,
@@ -165,6 +183,7 @@ export const usePlotStore = create<PlotStoreState>((set, get) => ({
               seedlings,
               plantings,
               surveys,
+              requisitions,
               stats,
               summaries,
               loading: false,

@@ -22,6 +22,8 @@ export interface Replant {
   planDate: string;
   /** 补植树种 */
   species: SeedlingSpecies;
+  /** 补植领用的苗木批次（班组侧补植领用据此扣减批次余量） */
+  seedlingId: string;
   /** 补植状态 */
   state: ReplantState;
   createdAt: string;
@@ -35,5 +37,6 @@ export interface ReplantDraft {
   missingCount: number;
   planDate: string;
   species: SeedlingSpecies;
+  seedlingId: string;
   state: ReplantState;
 }

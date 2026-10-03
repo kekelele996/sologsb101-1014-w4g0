@@ -1,12 +1,16 @@
 /**
  * 成活率派生 hook
  * 按地块与测次算成活率、株高增幅与补植建议；被验收台与补植计划页复用。
+ * v3 起成活率分母只统计「领用已扣减」的栽植，挂起 / 驳回领用不计入；
+ * 已定稿验收展示定稿快照，复算后的差异等待人工复认。
  */
 import { useEffect, useMemo, useState } from 'react';
 import { liveQuery } from 'dexie';
 import type { Survey, RateLevel } from '../types/survey';
 import type { Planting } from '../types/planting';
+import type { Requisition } from '../types/requisition';
 import { db, initDatabase } from '../utils/db';
+import { effectivePlantedTotal } from '../utils/inventory';
 import {
   SURVIVAL_WARN_RATE,
   calcSurvivalRate,
@@ -23,8 +27,12 @@ export interface SurvivalPoint {
   date: string;
   aliveCount: number;
   avgHeightCm: number;
-  /** 该测次的成活率（%） */
+  /** 该测次的成活率（%）——非定稿记录为实时复算值，定稿记录取定稿快照 */
   rate: number;
+  /** 是否已人工定稿 */
+  finalized: boolean;
+  /** 定稿后是否等待复认 */
+  pendingReconfirm: boolean;
   /** 是否被人工复核过等级 */
   gradeManual: boolean;
   level: RateLevel;
@@ -33,7 +41,7 @@ export interface SurvivalPoint {
 /** 单个地块的成活率派生汇总 */
 export interface SurvivalSummary {
   plotId: string;
-  /** 栽植总株数 */
+  /** 有效栽植总株数（仅已扣减领用对应的栽植计入） */
   totalCount: number;
   /** 按测次排序的数据点 */
   points: SurvivalPoint[];
@@ -55,24 +63,30 @@ export interface SurvivalSummary {
   level: RateLevel;
   /** 是否低于告警阈值 */
   warn: boolean;
+  /** 等待复认的定稿测次数（批次数量变动触发复算后 > 0） */
+  pendingReconfirmCount: number;
 }
 
-/** 纯函数：由验收记录与栽植记录派生地块成活率汇总 */
+/** 纯函数：由验收记录、栽植记录与领用登记派生地块成活率汇总 */
 export function buildSurvivalSummary(
   plotId: string,
   surveys: Survey[],
   plantings: Planting[],
   threshold: number = SURVIVAL_WARN_RATE,
+  requisitions: Requisition[] = [],
 ): SurvivalSummary {
-  const totalCount = plantings
-    .filter((row) => row.plotId === plotId)
-    .reduce((acc, row) => acc + row.count, 0);
+  const totalCount = effectivePlantedTotal(plotId, plantings, requisitions);
 
   const points: SurvivalPoint[] = surveys
     .filter((row) => row.plotId === plotId)
     .sort((a, b) => a.round - b.round)
     .map((row) => {
-      const rate = totalCount > 0 ? calcSurvivalRate(row.aliveCount, totalCount) : row.survivalRate;
+      // 定稿结论留痕：展示定稿快照；未定稿展示按有效栽植实时复算的成活率
+      const rate = row.finalized
+        ? row.finalizedRate
+        : totalCount > 0
+          ? calcSurvivalRate(row.aliveCount, totalCount)
+          : row.survivalRate;
       return {
         surveyId: row.id,
         round: row.round,
@@ -80,6 +94,8 @@ export function buildSurvivalSummary(
         aliveCount: row.aliveCount,
         avgHeightCm: row.avgHeightCm,
         rate,
+        finalized: row.finalized,
+        pendingReconfirm: row.pendingReconfirm,
         gradeManual: row.gradeManual,
         level: row.gradeManual ? row.grade : rateLevel(rate),
       };
@@ -102,6 +118,7 @@ export function buildSurvivalSummary(
     suggestReplant: latest ? suggestReplantCount(totalCount, latest.aliveCount) : totalCount,
     level: latest ? latest.level : 'poor',
     warn: latest !== null && latest.rate < threshold,
+    pendingReconfirmCount: points.filter((point) => point.pendingReconfirm).length,
   };
 }
 
@@ -117,11 +134,12 @@ export function emptySummary(plotId: string): SurvivalSummary {
 }
 
 /**
- * 订阅某地块的验收与栽植记录，实时派生成活率、株高增幅与补植建议。
+ * 订阅某地块的验收、栽植与领用记录，实时派生成活率、株高增幅与补植建议。
  */
 export function useSurvivalRate(plotId: string | null, threshold: number = SURVIVAL_WARN_RATE): UseSurvivalRateResult {
   const [surveys, setSurveys] = useState<Survey[]>([]);
   const [plantings, setPlantings] = useState<Planting[]>([]);
+  const [requisitions, setRequisitions] = useState<Requisition[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
 
@@ -130,13 +148,18 @@ export function useSurvivalRate(plotId: string | null, threshold: number = SURVI
     setLoading(true);
     const subscription = liveQuery(async () => {
       await initDatabase();
-      const [surveyRows, plantingRows] = await Promise.all([db.surveys.toArray(), db.plantings.toArray()]);
-      return { surveyRows, plantingRows };
+      const [surveyRows, plantingRows, requisitionRows] = await Promise.all([
+        db.surveys.toArray(),
+        db.plantings.toArray(),
+        db.requisitions.toArray(),
+      ]);
+      return { surveyRows, plantingRows, requisitionRows };
     }).subscribe({
-      next: ({ surveyRows, plantingRows }) => {
+      next: ({ surveyRows, plantingRows, requisitionRows }) => {
         if (!active) return;
         setSurveys(surveyRows);
         setPlantings(plantingRows);
+        setRequisitions(requisitionRows);
         setError('');
         setLoading(false);
       },
@@ -153,8 +176,11 @@ export function useSurvivalRate(plotId: string | null, threshold: number = SURVI
   }, []);
 
   const summary = useMemo(
-    () => (plotId === null ? emptySummary('') : buildSurvivalSummary(plotId, surveys, plantings, threshold)),
-    [plotId, surveys, plantings, threshold],
+    () =>
+      plotId === null
+        ? emptySummary('')
+        : buildSurvivalSummary(plotId, surveys, plantings, threshold, requisitions),
+    [plotId, surveys, plantings, requisitions, threshold],
   );
 
   return { summary, loading, error };

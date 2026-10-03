@@ -1,15 +1,24 @@
 /**
  * 验收状态管理（Zustand）
  * 维护验收筛选条件、批量选中的记录与成活率等级草稿；
- * 成活率派生值统一由 hooks/useSurvivalRate 的纯函数产出，避免口径分散。
+ * 成活率口径统一由 hooks/useSurvivalRate 的纯函数产出（分母只算已扣减领用的栽植）。
+ * 定稿结论在批次数量变动触发复算时留痕，复算完由人工复认。
  */
 import { create } from 'zustand';
-import type { RateLevel, Survey } from '../types/survey';
-import { db, initDatabase, patchSurveyGrades, putSurvey, removeSurvey } from '../utils/db';
+import type { RateLevel, Survey, SurveyDraft } from '../types/survey';
+import {
+  db,
+  finalizeSurvey,
+  initDatabase,
+  patchSurveyGrades,
+  putSurvey,
+  reconfirmSurvey,
+  removeSurvey,
+  unfinalizeSurvey,
+} from '../utils/db';
 import type { SurvivalSummary } from '../hooks/useSurvivalRate';
 import { nowIso, uuid } from '../utils/id';
 import { calcSurvivalRate, rateLevel } from '../utils/rate';
-import type { SurveyDraft } from '../types/survey';
 import { usePlotStore } from './plotStore';
 
 /** 验收筛选条件（地块 + 等级 + 关键字 + 日期区间） */
@@ -40,6 +49,10 @@ interface SurveyStoreState {
   createSurvey: (draft: SurveyDraft) => Promise<Survey>;
   updateSurvey: (surveyId: string, draft: SurveyDraft) => Promise<void>;
   deleteSurvey: (surveyId: string) => Promise<void>;
+  /** 定稿 / 撤销定稿 / 复认 */
+  finalize: (surveyId: string) => Promise<void>;
+  unfinalize: (surveyId: string) => Promise<void>;
+  reconfirm: (surveyId: string) => Promise<void>;
   /** 批量调整成活率等级（人工复核） */
   bulkApplyGrade: (level: RateLevel) => Promise<number>;
   /** 按最新测次生成补植计划（回写地块缺株数） */
@@ -48,10 +61,17 @@ interface SurveyStoreState {
   rateStats: () => { total: number; warnCount: number; avgRate: number };
 }
 
-function totalPlantedOf(plotId: string): number {
-  return usePlotStore
-    .getState()
-    .plantings.filter((row) => row.plotId === plotId)
+/** 有效栽植总株数：只统计领用已扣减的栽植 */
+function effectivePlantedOf(plotId: string): number {
+  const { plantings, requisitions } = usePlotStore.getState();
+  const deductedPlantingIds = new Set(
+    requisitions
+      .filter((row) => row.plotId === plotId && row.purpose === '栽植' && row.status === '已扣减')
+      .map((row) => row.plantingId)
+      .filter((id): id is string => id !== undefined),
+  );
+  return plantings
+    .filter((row) => row.plotId === plotId && deductedPlantingIds.has(row.id))
     .reduce((acc, row) => acc + row.count, 0);
 }
 
@@ -84,7 +104,7 @@ export const useSurveyStore = create<SurveyStoreState>((set, get) => ({
   },
 
   async createSurvey(draft) {
-    const total = totalPlantedOf(draft.plotId);
+    const total = effectivePlantedOf(draft.plotId);
     const survivalRate = calcSurvivalRate(draft.aliveCount, total);
     const stamp = nowIso();
     const row: Survey = {
@@ -97,9 +117,15 @@ export const useSurveyStore = create<SurveyStoreState>((set, get) => ({
       survivalRate,
       grade: rateLevel(survivalRate),
       gradeManual: false,
+      finalized: false,
+      finalizedAt: '',
+      finalizedTotalCount: 0,
+      finalizedRate: 0,
+      pendingReconfirm: false,
+      recalculatedRate: survivalRate,
       createdAt: stamp,
       updatedAt: stamp,
-      revision: 2,
+      revision: 3,
     };
     await putSurvey(row);
     set({ revision: get().revision + 1 });
@@ -109,23 +135,53 @@ export const useSurveyStore = create<SurveyStoreState>((set, get) => ({
   async updateSurvey(surveyId, draft) {
     const existing = await db.surveys.get(surveyId);
     if (!existing) return;
-    const total = totalPlantedOf(draft.plotId);
+    const total = effectivePlantedOf(draft.plotId);
     const survivalRate = calcSurvivalRate(draft.aliveCount, total);
-    await putSurvey({
-      ...existing,
-      plotId: draft.plotId,
-      round: draft.round,
-      date: draft.date,
-      aliveCount: draft.aliveCount,
-      avgHeightCm: draft.avgHeightCm,
-      survivalRate,
-    });
+    // 已定稿的验收编辑实测数据时，结论保持定稿快照，差异进入待复认
+    const next: Survey = existing.finalized
+      ? {
+          ...existing,
+          plotId: draft.plotId,
+          round: draft.round,
+          date: draft.date,
+          aliveCount: draft.aliveCount,
+          avgHeightCm: draft.avgHeightCm,
+          recalculatedRate: survivalRate,
+          pendingReconfirm: Math.abs(survivalRate - existing.finalizedRate) > 0.05,
+        }
+      : {
+          ...existing,
+          plotId: draft.plotId,
+          round: draft.round,
+          date: draft.date,
+          aliveCount: draft.aliveCount,
+          avgHeightCm: draft.avgHeightCm,
+          survivalRate,
+          recalculatedRate: survivalRate,
+          pendingReconfirm: false,
+        };
+    await putSurvey(next);
     set({ revision: get().revision + 1 });
   },
 
   async deleteSurvey(surveyId) {
     await removeSurvey(surveyId);
     set({ selectedIds: get().selectedIds.filter((id) => id !== surveyId), revision: get().revision + 1 });
+  },
+
+  async finalize(surveyId) {
+    await finalizeSurvey(surveyId);
+    set({ revision: get().revision + 1, lastMessage: '验收结论已定稿，后续复算将保留结论并挂待复认' });
+  },
+
+  async unfinalize(surveyId) {
+    await unfinalizeSurvey(surveyId);
+    set({ revision: get().revision + 1 });
+  },
+
+  async reconfirm(surveyId) {
+    await reconfirmSurvey(surveyId);
+    set({ revision: get().revision + 1, lastMessage: '已按复算结果复认，定稿结论已更新' });
   },
 
   async bulkApplyGrade(level) {
@@ -143,18 +199,20 @@ export const useSurveyStore = create<SurveyStoreState>((set, get) => ({
     if (!plot) return '地块不存在，无法生成补植计划';
     const missing = summary.suggestReplant;
     if (missing <= 0) return '该地块当前无缺株，无需生成补植计划';
-    const species = usePlotStore.getState().seedlings.find((row) => row.plotId === plotId)?.species ?? '秋茄';
+    const seedlings = usePlotStore.getState().seedlings.filter((row) => row.plotId === plotId);
+    const seedling = seedlings.find((row) => row.species === '秋茄') ?? seedlings[0];
     const stamp = nowIso();
     await db.replants.put({
       id: uuid('replant'),
       plotId,
       missingCount: missing,
       planDate: new Date(Date.now() + 15 * 24 * 3600 * 1000).toISOString().slice(0, 10),
-      species,
+      species: seedling?.species ?? '秋茄',
+      seedlingId: seedling?.id ?? '',
       state: '待补植',
       createdAt: stamp,
       updatedAt: stamp,
-      revision: 2,
+      revision: 3,
     });
     set({ revision: get().revision + 1, lastMessage: `已为「${plot.name}」生成补植计划：缺株 ${missing} 株` });
     return `已生成补植计划：缺株 ${missing} 株`;

@@ -18,17 +18,21 @@ import {
   Space,
   Table,
   Tag,
+  Tooltip,
   Typography,
 } from 'antd';
 import type { ColumnsType } from 'antd/es/table';
 import {
+  CheckCircleOutlined,
   DeleteOutlined,
   EditOutlined,
   ExperimentOutlined,
+  LockOutlined,
   PlusOutlined,
   RiseOutlined,
   FallOutlined,
   ToolOutlined,
+  UnlockOutlined,
 } from '@ant-design/icons';
 import dayjs, { type Dayjs } from 'dayjs';
 import EmptyPanel from '../components/common/EmptyPanel';
@@ -67,6 +71,9 @@ export default function SurveyBoard() {
   const createSurvey = useSurveyStore((state) => state.createSurvey);
   const updateSurvey = useSurveyStore((state) => state.updateSurvey);
   const deleteSurvey = useSurveyStore((state) => state.deleteSurvey);
+  const finalize = useSurveyStore((state) => state.finalize);
+  const unfinalize = useSurveyStore((state) => state.unfinalize);
+  const reconfirm = useSurveyStore((state) => state.reconfirm);
   const surveyRevision = useSurveyStore((state) => state.revision);
 
   const { rows, loading, remove } = useIdbTable<Survey>(db.surveys, { sortByUpdatedAt: false });
@@ -97,6 +104,8 @@ export default function SurveyBoard() {
       .sort((a, b) => b.date.localeCompare(a.date) || b.round - a.round);
     // surveyRevision 用于写操作后强制重算派生列
   }, [rows, filters, plots, summaryOf, surveyRevision]);
+
+  const pendingReconfirmRows = rows.filter((row) => row.pendingReconfirm);
 
   const plotName = (plotId: string): string => plots.find((item) => item.id === plotId)?.name ?? '（地块已删除）';
 
@@ -225,16 +234,33 @@ export default function SurveyBoard() {
     {
       title: '成活率',
       key: 'rate',
-      width: 180,
+      width: 230,
       render: (_value, record) => {
         const summary = summaryOf(record.plotId);
         const point = summary.points.find((item) => item.surveyId === record.id);
         return (
-          <RateTag
-            rate={point?.rate ?? record.survivalRate}
-            level={point?.level ?? record.grade}
-            manual={record.gradeManual}
-          />
+          <Space direction="vertical" size={2}>
+            <RateTag
+              rate={point?.rate ?? record.survivalRate}
+              level={point?.level ?? record.grade}
+              manual={record.gradeManual}
+            />
+            {record.finalized ? (
+              record.pendingReconfirm ? (
+                <Tooltip
+                  title={`定稿结论 ${record.finalizedRate.toFixed(1)}%（有效栽植 ${record.finalizedTotalCount.toLocaleString('zh-CN')} 株）；批次数量变动后复算为 ${record.recalculatedRate.toFixed(1)}%，待人工复认`}
+                >
+                  <Tag color="volcano" icon={<LockOutlined />}>
+                    定稿待复认 · 复算 {record.recalculatedRate.toFixed(1)}%
+                  </Tag>
+                </Tooltip>
+              ) : (
+                <Tag color="geekblue" icon={<LockOutlined />}>
+                  已定稿 {record.finalizedRate.toFixed(1)}%
+                </Tag>
+              )
+            ) : null}
+          </Space>
         );
       },
     },
@@ -265,18 +291,61 @@ export default function SurveyBoard() {
       },
     },
     {
-      title: '等级来源',
+      title: '结论状态',
       key: 'gradeSource',
-      width: 110,
-      render: (_value, record) =>
-        record.gradeManual ? <Tag color="purple">人工复核</Tag> : <Tag>自动判定</Tag>,
+      width: 130,
+      render: (_value, record) => (
+        <Space direction="vertical" size={2}>
+          {record.finalized ? <Tag color="geekblue">已定稿</Tag> : <Tag>未定稿</Tag>}
+          {record.gradeManual ? <Tag color="purple">人工复核</Tag> : <Tag>自动判定</Tag>}
+        </Space>
+      ),
     },
     {
       title: '操作',
       key: 'action',
-      width: 150,
+      width: 260,
       render: (_value, record) => (
-        <Space size={4}>
+        <Space size={4} wrap>
+          {record.pendingReconfirm ? (
+            <Popconfirm
+              title="确认按复算结果复认定稿结论？"
+              description={`定稿 ${record.finalizedRate.toFixed(1)}% → 复算 ${record.recalculatedRate.toFixed(1)}%，复认后定稿快照同步刷新。`}
+              okText="复认"
+              cancelText="取消"
+              onConfirm={async () => {
+                await reconfirm(record.id);
+                message.success('已定稿结论复认完成');
+              }}
+            >
+              <Button size="small" type="primary" icon={<CheckCircleOutlined />}>
+                复认
+              </Button>
+            </Popconfirm>
+          ) : null}
+          {!record.finalized ? (
+            <Popconfirm
+              title="定稿该测次验收结论？"
+              description="定稿后批次数量变动只触发复算与待复认，不会覆盖该结论。"
+              okText="定稿"
+              cancelText="取消"
+              onConfirm={async () => {
+                await finalize(record.id);
+                message.success('验收结论已定稿');
+              }}
+            >
+              <Button size="small" type="link" icon={<LockOutlined />}>
+                定稿
+              </Button>
+            </Popconfirm>
+          ) : (
+            <Button size="small" type="link" icon={<UnlockOutlined />} onClick={async () => {
+              await unfinalize(record.id);
+              message.success('已撤销定稿');
+            }}>
+              撤定稿
+            </Button>
+          )}
           <Button size="small" type="link" icon={<EditOutlined />} onClick={() => openEdit(record)}>
             编辑
           </Button>
@@ -325,7 +394,33 @@ export default function SurveyBoard() {
           tone={stats.warnCount > 0 ? 'danger' : 'default'}
           hint={`最新成活率低于 ${SURVIVAL_WARN_RATE}% 的地块`}
         />
+        <StatBadge
+          label="定稿待复认"
+          value={pendingReconfirmRows.length}
+          suffix="条"
+          tone={pendingReconfirmRows.length > 0 ? 'warning' : 'default'}
+          hint="批次数量修改触发复算后，已定稿但结论与复算结果不一致的验收记录"
+        />
       </div>
+
+      {pendingReconfirmRows.length > 0 ? (
+        <Alert
+          type="warning"
+          showIcon
+          style={{ marginBottom: 14 }}
+          message={`有 ${pendingReconfirmRows.length} 条定稿验收结论等待复认`}
+          description={
+            <Space direction="vertical" size={2}>
+              {pendingReconfirmRows.map((row) => (
+                <span key={row.id}>
+                  {plots.find((item) => item.id === row.plotId)?.name ?? row.plotId} · 第 {row.round} 测次：定稿{' '}
+                  {row.finalizedRate.toFixed(1)}%，复算 {row.recalculatedRate.toFixed(1)}%——批次数量已变动，复算完请人工「复认」。
+                </span>
+              ))}
+            </Space>
+          }
+        />
+      ) : null}
 
       {warnPlots.length > 0 ? (
         <Alert
@@ -436,7 +531,7 @@ export default function SurveyBoard() {
             loading={loading || !ready}
             columns={columns}
             dataSource={filtered}
-            scroll={{ x: 1280 }}
+            scroll={{ x: 1500 }}
             rowSelection={{
               selectedRowKeys: selectedIds,
               onChange: (keys) => setSelectedIds(keys.map((key) => String(key))),
@@ -491,7 +586,7 @@ export default function SurveyBoard() {
             </Form.Item>
           </Space>
           <Typography.Text type="secondary" style={{ fontSize: 12 }}>
-            成活率 = 成活株数 / 该地块栽植总株数，保存时自动计算；成活率低于 {SURVIVAL_WARN_RATE}% 会给出告警提示。
+            成活率 = 成活株数 / 有效栽植总株数（仅领用已扣减的栽植计入），保存时自动计算；定稿后批次数量变动只触发复算与待复认，不覆盖结论。
           </Typography.Text>
         </Form>
       </Modal>

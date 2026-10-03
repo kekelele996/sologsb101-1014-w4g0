@@ -10,6 +10,7 @@ import {
   BarChartOutlined,
   DashboardOutlined,
   ExperimentOutlined,
+  FileProtectOutlined,
   ToolOutlined,
 } from '@ant-design/icons';
 import { ROUTES } from './router';
@@ -24,6 +25,7 @@ const { Header, Sider, Content, Footer } = Layout;
 function selectedKey(pathname: string): string {
   if (pathname.startsWith('/plots/')) return ROUTES.plots;
   if (pathname.startsWith('/surveys')) return ROUTES.surveys;
+  if (pathname.startsWith('/requisitions')) return ROUTES.requisitions;
   if (pathname.startsWith('/replants')) return ROUTES.replants;
   return ROUTES.plots;
 }
@@ -69,6 +71,7 @@ export default function App() {
           items={[
             { key: ROUTES.plots, icon: <AppstoreOutlined />, label: '修复地块台账' },
             { key: ROUTES.surveys, icon: <ExperimentOutlined />, label: '成活率验收台' },
+            { key: ROUTES.requisitions, icon: <FileProtectOutlined />, label: '领用挂起台' },
             { key: ROUTES.replants, icon: <ToolOutlined />, label: '补植计划' },
           ]}
         />
@@ -80,8 +83,9 @@ export default function App() {
             <BarChartOutlined /> 栽植 {counts.plantings ?? 0} · 验收 {counts.surveys ?? 0}
           </div>
           <div>
-            <ToolOutlined /> 补植 {counts.replants ?? 0} · 结构 v{String(counts.schemaVersion ?? '-')}
+            <FileProtectOutlined /> 领用 {counts.requisitions ?? 0} · 补植 {counts.replants ?? 0}
           </div>
+          <div>结构 v{String(counts.schemaVersion ?? '-')}</div>
         </div>
       </Sider>
 

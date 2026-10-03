@@ -18,6 +18,7 @@ import {
   Space,
   Table,
   Tag,
+  Tooltip,
   Typography,
   Upload,
 } from 'antd';
@@ -40,8 +41,10 @@ import { useIdbTable } from '../hooks/useIdbTable';
 import { usePlotStore } from '../stores/plotStore';
 import { useReplantStore } from '../stores/replantStore';
 import { DB_NAME, DB_SCHEMA_VERSION, db } from '../utils/db';
+import { batchStock } from '../utils/inventory';
 import { REPLANT_STATE_OPTIONS, type Replant, type ReplantDraft, type ReplantState } from '../types/replant';
 import { SEEDLING_SPECIES_OPTIONS, type SeedlingSpecies } from '../types/seedling';
+import type { Requisition } from '../types/requisition';
 import { exportSnapshotJson, exportSummaryCsvFile, parseSnapshot } from '../utils/export';
 import { percentText } from '../utils/rate';
 
@@ -50,6 +53,7 @@ interface ReplantFormValues {
   missingCount: number;
   planDate: Dayjs;
   species: SeedlingSpecies;
+  seedlingId: string;
   state: ReplantState;
 }
 
@@ -82,12 +86,33 @@ export default function ReplantPlan() {
   const lastMessage = useReplantStore((state) => state.lastMessage);
 
   const { rows, loading, update } = useIdbTable<Replant>(db.replants, { sortByUpdatedAt: false });
+  const requisitionTable = useIdbTable<Requisition>(db.requisitions, { sortByUpdatedAt: false });
   const [open, setOpen] = useState(false);
   const [editing, setEditing] = useState<Replant | null>(null);
   const [submitting, setSubmitting] = useState(false);
   const [form] = Form.useForm<ReplantFormValues>();
+  const watchPlotId = Form.useWatch('plotId', form) as string | undefined;
 
   const plotName = (plotId: string): string => plots.find((item) => item.id === plotId)?.name ?? '（地块已删除）';
+
+  /** 补植计划 id → 补植领用（取最新一条） */
+  const requisitionByReplant = useMemo(() => {
+    const map = new Map<string, Requisition>();
+    requisitionTable.rows
+      .filter((row) => row.replantId !== undefined)
+      .sort((a, b) => b.createdAt.localeCompare(a.createdAt))
+      .forEach((row) => {
+        if (!map.has(row.replantId as string)) map.set(row.replantId as string, row);
+      });
+    return map;
+  }, [requisitionTable.rows]);
+
+  const plotSeedlingsOf = (plotId: string) => seedlings.filter((row) => row.plotId === plotId);
+
+  const seedlingText = (seedlingId: string): string => {
+    const row = seedlings.find((item) => item.id === seedlingId);
+    return row === undefined ? '（批次已删除）' : `${row.species} · ${row.spec}`;
+  };
 
   const filtered = useMemo(() => {
     const key = filters.keyword.trim().toLowerCase();
@@ -118,11 +143,13 @@ export default function ReplantPlan() {
     setEditing(null);
     const plotId = filters.plotId !== 'all' ? filters.plotId : plots.length > 0 ? plots[0].id : '';
     const stat = statOf(plotId);
+    const plotSeedlingList = plotSeedlingsOf(plotId);
     form.setFieldsValue({
       plotId,
       missingCount: stat.suggestReplant > 0 ? stat.suggestReplant : 100,
       planDate: dayjs().add(15, 'day'),
-      species: seedlings.find((row) => row.plotId === plotId)?.species ?? '秋茄',
+      species: plotSeedlingList[0]?.species ?? '秋茄',
+      seedlingId: plotSeedlingList[0]?.id ?? '',
       state: '待补植',
     });
     setOpen(true);
@@ -135,6 +162,7 @@ export default function ReplantPlan() {
       missingCount: row.missingCount,
       planDate: dayjs(row.planDate),
       species: row.species,
+      seedlingId: row.seedlingId,
       state: row.state,
     });
     setOpen(true);
@@ -149,6 +177,7 @@ export default function ReplantPlan() {
         missingCount: values.missingCount,
         planDate: values.planDate.format('YYYY-MM-DD'),
         species: values.species,
+        seedlingId: values.seedlingId,
         state: values.state,
       };
       if (editing === null) {
@@ -167,12 +196,16 @@ export default function ReplantPlan() {
   };
 
   const handleAdvance = async (row: Replant): Promise<void> => {
-    const next = await advance(row.id);
-    if (next === null) {
+    const result = await advance(row.id);
+    if (result.state === null) {
       message.info('该计划已处于最终状态（已复核）');
       return;
     }
-    message.success(`状态已推进为「${next}」`);
+    if (result.pending) {
+      message.warning(`状态已推进为「${result.state}」，但补植领用因批次余量不足挂起，待苗圃确认后扣减`, 6);
+      return;
+    }
+    message.success(`状态已推进为「${result.state}」`);
   };
 
   const handleExport = async (): Promise<void> => {
@@ -182,7 +215,14 @@ export default function ReplantPlan() {
   };
 
   const handleExportCsv = (): void => {
-    const filename = exportSummaryCsvFile(plots, seedlings, plantings, surveys, rows);
+    const filename = exportSummaryCsvFile(
+      plots,
+      seedlings,
+      plantings,
+      surveys,
+      rows,
+      requisitionTable.rows,
+    );
     message.success(`已导出成活率汇总 ${filename}`);
   };
 
@@ -282,6 +322,34 @@ export default function ReplantPlan() {
             onChange={(value: SeedlingSpecies) => setDraft(record.id, { species: value })}
             options={SEEDLING_SPECIES_OPTIONS.map((value) => ({ value, label: value }))}
           />
+        );
+      },
+    },
+    {
+      title: '补植领用批次',
+      key: 'requisition',
+      width: 190,
+      render: (_value, record) => {
+        const req = requisitionByReplant.get(record.id);
+        const seedling = seedlings.find((item) => item.id === record.seedlingId);
+        const remaining = seedling === undefined ? null : batchStock(seedling, requisitionTable.rows).remaining;
+        return (
+          <Space direction="vertical" size={0}>
+            <span>{seedlingText(record.seedlingId)}</span>
+            {req === undefined ? (
+              <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+                推进到「已补植」时提交领用{remaining !== null ? `（余量 ${remaining.toLocaleString('zh-CN')} 株）` : ''}
+              </Typography.Text>
+            ) : req.status === '已扣减' ? (
+              <Tag color="success">领用已扣减 {req.count.toLocaleString('zh-CN')} 株</Tag>
+            ) : req.status === '挂起' ? (
+              <Tooltip title={req.note}>
+                <Tag color="error">领用挂起待确认</Tag>
+              </Tooltip>
+            ) : (
+              <Tag color="default">领用已驳回</Tag>
+            )}
+          </Space>
         );
       },
     },
@@ -467,7 +535,7 @@ export default function ReplantPlan() {
             loading={loading || !ready}
             columns={columns}
             dataSource={filtered}
-            scroll={{ x: 1400 }}
+            scroll={{ x: 1560 }}
             rowSelection={{
               selectedRowKeys: selectedIds,
               onChange: (keys) => setSelectedIds(keys.map((key) => String(key))),
@@ -489,7 +557,19 @@ export default function ReplantPlan() {
         okText="保存"
         cancelText="取消"
       >
-        <Form form={form} layout="vertical">
+        <Form
+          form={form}
+          layout="vertical"
+          onValuesChange={(changed) => {
+            if (changed.plotId !== undefined) {
+              const firstSeedling = plotSeedlingsOf(changed.plotId as string)[0];
+              form.setFieldsValue({
+                seedlingId: firstSeedling?.id ?? '',
+                species: firstSeedling?.species ?? form.getFieldValue('species'),
+              });
+            }
+          }}
+        >
           <Form.Item name="plotId" label="地块" rules={[{ required: true, message: '请选择地块' }]}>
             <Select options={plots.map((plot) => ({ value: plot.id, label: plot.name }))} />
           </Form.Item>
@@ -510,12 +590,29 @@ export default function ReplantPlan() {
             <Form.Item name="species" label="补植树种" style={{ flex: 1 }} rules={[{ required: true }]}>
               <Select options={SEEDLING_SPECIES_OPTIONS.map((value) => ({ value, label: value }))} />
             </Form.Item>
+            <Form.Item
+              name="seedlingId"
+              label="补植领用批次"
+              style={{ flex: 2 }}
+              rules={[{ required: true, message: '请选择补植领用的苗木批次' }]}
+            >
+              <Select
+                placeholder="选择该地块下的苗木批次"
+                options={plotSeedlingsOf(watchPlotId ?? '').map((row) => ({
+                  value: row.id,
+                  label: `${row.species} · ${row.spec} · 余量 ${batchStock(
+                    row,
+                    requisitionTable.rows,
+                  ).remaining.toLocaleString('zh-CN')} 株`,
+                }))}
+              />
+            </Form.Item>
             <Form.Item name="state" label="状态" style={{ flex: 1 }} rules={[{ required: true }]}>
               <Select options={REPLANT_STATE_OPTIONS.map((value) => ({ value, label: value }))} />
             </Form.Item>
           </Space>
           <Typography.Text type="secondary" style={{ fontSize: 12 }}>
-            状态推进到「已补植」时，会自动回写地块缺株数并重算最新一次验收的成活率。
+            状态推进到「已补植」时提交补植领用：批次余量足则扣减并回写缺株数、重算最新成活率；扣不下先挂起，待苗圃确认后补做回写。
           </Typography.Text>
         </Form>
       </Modal>

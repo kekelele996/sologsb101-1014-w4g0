@@ -33,6 +33,18 @@ export interface Survey {
   grade: RateLevel;
   /** 该等级是否被人工调整过 */
   gradeManual: boolean;
+  /** 验收结论是否已定稿（定稿后留痕，批次数量变动触发复算时不直接覆盖结论） */
+  finalized: boolean;
+  /** 定稿时间 ISO，未定稿为空串 */
+  finalizedAt: string;
+  /** 定稿时的栽植总株数快照（复算依据） */
+  finalizedTotalCount: number;
+  /** 定稿时的成活率快照（%） */
+  finalizedRate: number;
+  /** 批次数量 / 领用变动导致复算后，定稿结论是否等待人工复认 */
+  pendingReconfirm: boolean;
+  /** 复算后的最新成活率（%），与 finalizedRate 对照展示 */
+  recalculatedRate: number;
   createdAt: string;
   updatedAt: string;
   revision: number;
