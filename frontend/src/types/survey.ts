@@ -33,6 +33,10 @@ export interface Survey {
   grade: RateLevel;
   /** 该等级是否被人工调整过 */
   gradeManual: boolean;
+  /** 是否定稿（验收结论定稿后不随批次数量变动立即改写，挂起等复算确认） */
+  finalized: boolean;
+  /** 待复算的成活率（%）：批次数量变动触发复算后，定稿记录暂存的新口径值；null 表示无待复算 */
+  recalcRate: number | null;
   createdAt: string;
   updatedAt: string;
   revision: number;

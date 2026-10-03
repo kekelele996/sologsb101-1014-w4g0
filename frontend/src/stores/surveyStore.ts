@@ -49,10 +49,14 @@ interface SurveyStoreState {
 }
 
 function totalPlantedOf(plotId: string): number {
-  return usePlotStore
-    .getState()
-    .plantings.filter((row) => row.plotId === plotId)
-    .reduce((acc, row) => acc + row.count, 0);
+  // 口径与成活率派生保持一致：以「已扣栽植领用」合计为准
+  const state = usePlotStore.getState();
+  if (state.requisitions.length > 0) {
+    return state.requisitions
+      .filter((row) => row.plotId === plotId && row.kind === '栽植' && row.status === '已扣')
+      .reduce((acc, row) => acc + row.quantity, 0);
+  }
+  return state.plantings.filter((row) => row.plotId === plotId).reduce((acc, row) => acc + row.count, 0);
 }
 
 export const useSurveyStore = create<SurveyStoreState>((set, get) => ({
@@ -97,9 +101,11 @@ export const useSurveyStore = create<SurveyStoreState>((set, get) => ({
       survivalRate,
       grade: rateLevel(survivalRate),
       gradeManual: false,
+      finalized: false,
+      recalcRate: null,
       createdAt: stamp,
       updatedAt: stamp,
-      revision: 2,
+      revision: 3,
     };
     await putSurvey(row);
     set({ revision: get().revision + 1 });
@@ -119,6 +125,8 @@ export const useSurveyStore = create<SurveyStoreState>((set, get) => ({
       aliveCount: draft.aliveCount,
       avgHeightCm: draft.avgHeightCm,
       survivalRate,
+      // 直接编辑验收结论：定稿状态保留，待复算标记清除（本次即为人工确认后的口径）
+      recalcRate: null,
     });
     set({ revision: get().revision + 1 });
   },

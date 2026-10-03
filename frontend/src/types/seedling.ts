@@ -22,8 +22,10 @@ export interface Seedling {
   source: SeedlingSource;
   /** 规格（如 50cm 裸根苗 / 40cm 营养袋苗） */
   spec: string;
-  /** 数量（株） */
+  /** 数量（株）——进场数量 */
   quantity: number;
+  /** 退货数量（株）——苗圃登记的退货，余量 = 进场 - 退货 - 已扣领用 */
+  returnedQuantity: number;
   /** 进场日期 YYYY-MM-DD */
   arrivalDate: string;
   createdAt: string;

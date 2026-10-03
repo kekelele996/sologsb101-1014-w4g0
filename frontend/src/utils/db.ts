@@ -5,24 +5,25 @@
  * - 提供各表增删改查、整库快照导入导出与重置
  * 纯前端应用：不依赖任何后端服务或外部接口。
  */
-import Dexie, { type Table } from 'dexie';
+import Dexie, { type Table, type Transaction } from 'dexie';
 import type { Plot } from '../types/plot';
-import type { Seedling } from '../types/seedling';
+import type { Seedling, SeedlingSpecies } from '../types/seedling';
 import type { Planting } from '../types/planting';
 import type { Survey } from '../types/survey';
 import type { Replant, ReplantState } from '../types/replant';
-import { rateLevel } from './rate';
-import { nowIso, today } from './id';
+import type { Requisition, RequisitionStatus } from '../types/requisition';
+import { calcSurvivalRate, rateLevel } from './rate';
+import { nowIso, today, uuid } from './id';
 import { seedDatabase } from './seed';
 
 /** 数据库名 */
 export const DB_NAME = 'gbmangrove';
 
 /** 当前数据结构版本号（每次调整字段结构必须 +1 并补迁移） */
-export const DB_SCHEMA_VERSION = 2;
+export const DB_SCHEMA_VERSION = 3;
 
 /** 数据行结构修订号 */
-export const ROW_REVISION = 2;
+export const ROW_REVISION = 3;
 
 class MangroveDatabase extends Dexie {
   plots!: Table<Plot, string>;
@@ -30,6 +31,7 @@ class MangroveDatabase extends Dexie {
   plantings!: Table<Planting, string>;
   surveys!: Table<Survey, string>;
   replants!: Table<Replant, string>;
+  requisitions!: Table<Requisition, string>;
 
   constructor() {
     super(DB_NAME);
@@ -44,7 +46,7 @@ class MangroveDatabase extends Dexie {
     });
 
     // ---------- v2：补齐索引与回写字段，并迁移历史数据 ----------
-    this.version(DB_SCHEMA_VERSION)
+    this.version(2)
       .stores({
         plots: 'id, name, tideZone, substrate, restoreMode, state, createdAt, updatedAt',
         seedlings: 'id, plotId, species, source, arrivalDate, quantity',
@@ -80,6 +82,31 @@ class MangroveDatabase extends Dexie {
           if (typeof row.grade !== 'string') row.grade = rateLevel(rate);
           if (typeof row.gradeManual !== 'boolean') row.gradeManual = false;
         });
+      });
+
+    // ---------- v3：领用登记（批次核销）+ 退货 + 定稿验收，并按现有栽植与补植回填领用 ----------
+    this.version(DB_SCHEMA_VERSION)
+      .stores({
+        plots: 'id, name, tideZone, substrate, restoreMode, state, createdAt, updatedAt',
+        seedlings: 'id, plotId, species, source, arrivalDate, quantity, returnedQuantity',
+        plantings: 'id, plotId, seedlingId, plantDate, spacingM',
+        surveys: 'id, plotId, [plotId+round], date, grade, finalized',
+        replants: 'id, plotId, planDate, state, species',
+        // 领用表：按批次与状态索引，便于核销与挂起处理
+        requisitions: 'id, plotId, seedlingId, kind, status, date, refId',
+      })
+      .upgrade(async (tx) => {
+        // 迁移 4：苗木批次补「退货数量」
+        await tx.table('seedlings').toCollection().modify((row: Record<string, unknown>) => {
+          if (typeof row.returnedQuantity !== 'number') row.returnedQuantity = 0;
+        });
+        // 迁移 5：验收记录补「定稿 / 待复算」标记
+        await tx.table('surveys').toCollection().modify((row: Record<string, unknown>) => {
+          if (typeof row.finalized !== 'boolean') row.finalized = false;
+          if (row.recalcRate === undefined) row.recalcRate = null;
+        });
+        // 迁移 6：按现有栽植与补植回填领用登记（旧数据原本没有领用记录）
+        await backfillRequisitions(tx);
       });
   }
 }
@@ -153,11 +180,27 @@ export async function putSeedling(row: Seedling): Promise<void> {
   await db.seedlings.put({ ...row, updatedAt: nowIso(), revision: ROW_REVISION });
 }
 
+/**
+ * 保存苗木批次（新增 / 编辑进场数量或退货数量）。
+ * 保存后按 FIFO 重新核销该批次下的领用，并重算相关地块的成活率。
+ */
+export async function saveSeedling(row: Seedling): Promise<void> {
+  await db.transaction('rw', db.seedlings, db.requisitions, db.surveys, async (tx) => {
+    await tx.table('seedlings').put({ ...row, updatedAt: nowIso(), revision: ROW_REVISION });
+    const affected = await reevaluateBatches(tx, [row.id]);
+    await recalcPlotSurvival(tx, affected);
+  });
+}
+
 export async function removeSeedling(id: string): Promise<void> {
-  await db.transaction('rw', db.seedlings, db.plantings, async () => {
-    // 该批次已被栽植记录引用时一并清理，避免出现悬空引用
-    await db.plantings.where('seedlingId').equals(id).delete();
-    await db.seedlings.delete(id);
+  await db.transaction('rw', db.seedlings, db.plantings, db.requisitions, db.surveys, async (tx) => {
+    // 该批次已被栽植记录 / 领用记录引用时一并清理，避免出现悬空引用
+    const reqs = await tx.table('requisitions').where('seedlingId').equals(id).toArray();
+    const plotIds = new Set(reqs.map((row) => row.plotId));
+    await tx.table('requisitions').where('seedlingId').equals(id).delete();
+    await tx.table('plantings').where('seedlingId').equals(id).delete();
+    await tx.table('seedlings').delete(id);
+    await recalcPlotSurvival(tx, plotIds);
   });
 }
 
@@ -175,6 +218,52 @@ export async function listPlantingsByPlot(plotId: string): Promise<Planting[]> {
 
 export async function putPlanting(row: Planting): Promise<void> {
   await db.plantings.put({ ...row, updatedAt: nowIso(), revision: ROW_REVISION });
+}
+
+/**
+ * 保存栽植记录并同步生成「栽植领用」：
+ * 一条栽植记录对应一条领用，按批次余量 FIFO 核销，扣不下的挂起；
+ * 保存后重算相关地块成活率。
+ */
+export async function savePlantingWithRequisition(row: Planting): Promise<{ status: RequisitionStatus }> {
+  return db.transaction('rw', db.plantings, db.requisitions, db.seedlings, db.surveys, async (tx) => {
+    const existing = (await tx.table('plantings').get(row.id)) as Planting | undefined;
+    await tx.table('plantings').put({ ...row, updatedAt: nowIso(), revision: ROW_REVISION });
+    // 先清掉该栽植记录旧的领用（编辑时批次 / 株数可能变化），再重建
+    await tx.table('requisitions').where('refId').equals(row.id).delete();
+    await tx.table('requisitions').put({
+      id: uuid('requisition'),
+      plotId: row.plotId,
+      seedlingId: row.seedlingId,
+      kind: '栽植',
+      refId: row.id,
+      quantity: row.count,
+      operator: row.operator,
+      date: row.plantDate,
+      status: '挂起',
+      createdAt: nowIso(),
+      updatedAt: nowIso(),
+      revision: ROW_REVISION,
+    } as Requisition);
+    const batchIds = [existing?.seedlingId, row.seedlingId].filter((v): v is string => Boolean(v));
+    const affected = await reevaluateBatches(tx, batchIds);
+    await recalcPlotSurvival(tx, affected);
+    const created = await tx.table('requisitions').where('refId').equals(row.id).first();
+    return { status: (created?.status ?? '挂起') as RequisitionStatus };
+  });
+}
+
+/** 删除栽植记录时一并删除其领用，并重算相关地块成活率 */
+export async function deletePlantingWithRequisition(id: string): Promise<void> {
+  await db.transaction('rw', db.plantings, db.requisitions, db.seedlings, db.surveys, async (tx) => {
+    const existing = (await tx.table('plantings').get(id)) as Planting | undefined;
+    await tx.table('requisitions').where('refId').equals(id).delete();
+    await tx.table('plantings').delete(id);
+    if (existing) {
+      const affected = await reevaluateBatches(tx, [existing.seedlingId]);
+      await recalcPlotSurvival(tx, affected);
+    }
+  });
 }
 
 export async function removePlanting(id: string): Promise<void> {
@@ -234,46 +323,304 @@ export async function removeReplant(id: string): Promise<void> {
 }
 
 /**
- * 补植完成回写：
- * 1）扣减地块缺株数；2）写入最近补植日期；3）按补植后的总株数重算最新一次验收的成活率。
+ * 补植完成回写（内部事务）：
+ * 1）生成「补植领用」并按批次余量 FIFO 核销（扣不下挂起）；
+ * 2）扣减地块缺株数、写入最近补植日期；
+ * 3）按补植后的成活株数重算成活率（定稿验收挂起等复算，非定稿自动改写）。
+ * 已完成过的补植（已补植 / 已复核）不重复回写成活株数。
  */
-export async function applyReplantCompletion(replantId: string): Promise<void> {
-  await db.transaction('rw', db.plots, db.replants, db.surveys, db.plantings, async () => {
-    const replant = await db.replants.get(replantId);
-    if (!replant) return;
-    const plot = await db.plots.get(replant.plotId);
-    if (!plot) return;
-
-    const nextMissing = Math.max(0, plot.missingCount - replant.missingCount);
-    await db.plots.update(plot.id, {
-      missingCount: nextMissing,
-      lastReplantDate: today(),
+async function applyReplantCompletionTx(
+  tx: Transaction,
+  replant: Replant,
+  plot: Plot,
+): Promise<void> {
+  // 1）补植领用：按同树种余量自动匹配批次
+  let batchId = replant.seedlingId;
+  if (!batchId) {
+    const [seedlings, reqs] = await Promise.all([
+      tx.table('seedlings').where('plotId').equals(plot.id).toArray(),
+      tx.table('requisitions').where('plotId').equals(plot.id).toArray(),
+    ]);
+    batchId = pickBatchForSpecies(seedlings as Seedling[], reqs as Requisition[], plot.id, replant.species) ?? undefined;
+  }
+  if (batchId) {
+    await tx.table('replants').update(replant.id, { seedlingId: batchId, updatedAt: nowIso() });
+    // 幂等：先清掉该补植计划旧的领用，再重建
+    await tx.table('requisitions').where('refId').equals(replant.id).delete();
+    await tx.table('requisitions').put({
+      id: uuid('requisition'),
+      plotId: plot.id,
+      seedlingId: batchId,
+      kind: '补植',
+      refId: replant.id,
+      quantity: replant.missingCount,
+      operator: '补植班组',
+      date: replant.planDate,
+      status: '挂起',
+      createdAt: nowIso(),
       updatedAt: nowIso(),
-    });
+      revision: ROW_REVISION,
+    } as Requisition);
+    await reevaluateBatches(tx, [batchId]);
+  }
 
-    const plantings = await db.plantings.where('plotId').equals(plot.id).toArray();
-    const total = plantings.reduce((acc, item) => acc + item.count, 0);
-    const surveys = await db.surveys.where('plotId').equals(plot.id).toArray();
-    if (surveys.length === 0) return;
+  // 2）扣减地块缺株数、写入最近补植日期
+  const nextMissing = Math.max(0, plot.missingCount - replant.missingCount);
+  await tx.table('plots').update(plot.id, {
+    missingCount: nextMissing,
+    lastReplantDate: today(),
+    updatedAt: nowIso(),
+  });
+
+  // 3）按补植后的成活株数重算成活率
+  const surveys = (await tx.table('surveys').where('plotId').equals(plot.id).toArray()) as Survey[];
+  if (surveys.length > 0) {
     const latest = surveys.reduce((acc, item) => (item.round > acc.round ? item : acc));
-    // 补植后按「原成活株数 + 本次补植株数」重新计算成活率
     const aliveAfter = latest.aliveCount + replant.missingCount;
-    const rate = total > 0 ? Math.round(Math.min(100, (aliveAfter / total) * 100) * 10) / 10 : latest.survivalRate;
-    await db.surveys.update(latest.id, {
-      aliveCount: aliveAfter,
-      survivalRate: rate,
-      grade: latest.gradeManual ? latest.grade : rateLevel(rate),
-      updatedAt: nowIso(),
-    });
+    await tx.table('surveys').update(latest.id, { aliveCount: aliveAfter, updatedAt: nowIso() });
+  }
+  await recalcPlotSurvival(tx, new Set([plot.id]));
+}
+
+/** 推进补植状态（待补植 → 已补植 → 已复核）；首次进入「已补植 / 已复核」时触发回写与领用核销 */
+export async function advanceReplantState(replantId: string, next: ReplantState): Promise<void> {
+  await db.transaction('rw', db.replants, db.seedlings, db.requisitions, db.plots, db.surveys, async (tx) => {
+    const replant = (await tx.table('replants').get(replantId)) as Replant | undefined;
+    if (!replant) return;
+    const wasCompleted = replant.state === '已补植' || replant.state === '已复核';
+    await tx.table('replants').update(replantId, { state: next, updatedAt: nowIso() });
+    if (!wasCompleted && (next === '已补植' || next === '已复核')) {
+      const plot = (await tx.table('plots').get(replant.plotId)) as Plot | undefined;
+      if (plot) await applyReplantCompletionTx(tx, replant, plot);
+    }
   });
 }
 
-/** 推进补植状态（待补植 → 已补植 → 已复核），推进到「已补植」时触发回写 */
-export async function advanceReplantState(replantId: string, next: ReplantState): Promise<void> {
-  await db.replants.update(replantId, { state: next, updatedAt: nowIso() });
-  if (next === '已补植') {
-    await applyReplantCompletion(replantId);
+/* ------------------------------ 领用核销（苗圃管批次、班组管领用） ------------------------------ */
+
+/** 批次余量 = 进场数量 - 退货数量 - 已扣领用合计（株） */
+export function batchRemaining(seedling: Seedling, requisitions: Requisition[]): number {
+  const deducted = requisitions
+    .filter((row) => row.seedlingId === seedling.id && row.status === '已扣')
+    .reduce((acc, row) => acc + row.quantity, 0);
+  return seedling.quantity - (seedling.returnedQuantity ?? 0) - deducted;
+}
+
+/** 按同树种挑一个余量最大的批次（用于补植领用自动匹配），无批次返回 null */
+function pickBatchForSpecies(
+  seedlings: Seedling[],
+  requisitions: Requisition[],
+  plotId: string,
+  species: SeedlingSpecies,
+): string | null {
+  let bestId: string | null = null;
+  let bestRemaining = 0;
+  for (const seedling of seedlings) {
+    if (seedling.plotId !== plotId || seedling.species !== species) continue;
+    const remaining = batchRemaining(seedling, requisitions.filter((row) => row.seedlingId === seedling.id));
+    if (bestId === null || remaining > bestRemaining) {
+      bestId = seedling.id;
+      bestRemaining = remaining;
+    }
   }
+  return bestId;
+}
+
+/**
+ * 重新评估指定批次下所有领用的核销状态（FIFO：先发生的领用优先扣余量，扣不下的挂起）。
+ * 已驳回的领用不再参与核销。返回受影响的地块 id 集合。
+ */
+async function reevaluateBatches(tx: Transaction, seedlingIds: string[]): Promise<Set<string>> {
+  const affectedPlots = new Set<string>();
+  for (const seedlingId of seedlingIds) {
+    const seedling = (await tx.table('seedlings').get(seedlingId)) as Seedling | undefined;
+    if (!seedling) continue;
+    const rows = (await tx.table('requisitions').where('seedlingId').equals(seedlingId).toArray()) as Requisition[];
+    const available = seedling.quantity - (seedling.returnedQuantity ?? 0);
+    const ordered = rows
+      .filter((row) => row.status !== '已驳回')
+      .sort((a, b) => a.date.localeCompare(b.date) || a.createdAt.localeCompare(b.createdAt));
+    let cum = 0;
+    for (const row of ordered) {
+      affectedPlots.add(row.plotId);
+      const next: RequisitionStatus = cum + row.quantity <= available ? '已扣' : '挂起';
+      if (next === '已扣') cum += row.quantity;
+      if (row.status !== next) {
+        await tx.table('requisitions').update(row.id, { status: next, updatedAt: nowIso() });
+      }
+    }
+  }
+  return affectedPlots;
+}
+
+/**
+ * 批次数量变动后重算地块成活率：
+ * - 非定稿验收：按「已扣栽植领用」合计作为栽植总株数自动改写成活率；
+ * - 定稿验收：不立即改写，把复算后的成活率挂起（recalcRate），等人工复算确认。
+ */
+async function recalcPlotSurvival(tx: Transaction, plotIds: Set<string>): Promise<void> {
+  for (const plotId of plotIds) {
+    const reqs = (await tx.table('requisitions').where('plotId').equals(plotId).toArray()) as Requisition[];
+    const confirmedPlantTotal = reqs
+      .filter((row) => row.kind === '栽植' && row.status === '已扣')
+      .reduce((acc, row) => acc + row.quantity, 0);
+    const surveys = (await tx.table('surveys').where('plotId').equals(plotId).toArray()) as Survey[];
+    for (const survey of surveys) {
+      const newRate = calcSurvivalRate(survey.aliveCount, confirmedPlantTotal);
+      if (survey.finalized) {
+        await tx.table('surveys').update(survey.id, {
+          recalcRate: survey.survivalRate === newRate ? null : newRate,
+          updatedAt: nowIso(),
+        });
+      } else {
+        await tx.table('surveys').update(survey.id, {
+          survivalRate: newRate,
+          recalcRate: null,
+          grade: survey.gradeManual ? survey.grade : rateLevel(newRate),
+          updatedAt: nowIso(),
+        });
+      }
+    }
+  }
+}
+
+/**
+ * 升级回填：按现有栽植与补植生成领用登记（旧数据原本没有领用记录）。
+ * 一条栽植记录对应一条「栽植领用」；已完成的补植计划（已补植 / 已复核）对应一条「补植领用」。
+ * 回填后按批次 FIFO 统一核销一遍。
+ */
+export async function backfillRequisitions(tx: Transaction): Promise<void> {
+  const [plantings, replants, seedlings] = (await Promise.all([
+    tx.table('plantings').toArray(),
+    tx.table('replants').toArray(),
+    tx.table('seedlings').toArray(),
+  ])) as [Planting[], Replant[], Seedling[]];
+
+  const rows: Requisition[] = [];
+  for (const planting of plantings) {
+    rows.push({
+      id: uuid('requisition'),
+      plotId: planting.plotId,
+      seedlingId: planting.seedlingId,
+      kind: '栽植',
+      refId: planting.id,
+      quantity: planting.count,
+      operator: planting.operator,
+      date: planting.plantDate,
+      status: '挂起',
+      createdAt: planting.createdAt ?? nowIso(),
+      updatedAt: nowIso(),
+      revision: ROW_REVISION,
+    });
+  }
+  for (const replant of replants) {
+    if (replant.state !== '已补植' && replant.state !== '已复核') continue;
+    const batchId =
+      replant.seedlingId ?? pickBatchForSpecies(seedlings, rows, replant.plotId, replant.species) ?? undefined;
+    if (!batchId) continue;
+    rows.push({
+      id: uuid('requisition'),
+      plotId: replant.plotId,
+      seedlingId: batchId,
+      kind: '补植',
+      refId: replant.id,
+      quantity: replant.missingCount,
+      operator: '补植班组',
+      date: replant.planDate,
+      status: '挂起',
+      createdAt: replant.createdAt ?? nowIso(),
+      updatedAt: nowIso(),
+      revision: ROW_REVISION,
+    });
+  }
+
+  if (rows.length > 0) await tx.table('requisitions').bulkPut(rows);
+  const batchIds = new Set(rows.map((row) => row.seedlingId));
+  await reevaluateBatches(tx, [...batchIds]);
+  // 回填后按已扣栽植领用口径重算一遍成活率（非定稿自动改写）
+  const plotIds = new Set(rows.map((row) => row.plotId));
+  await recalcPlotSurvival(tx, plotIds);
+}
+
+export async function listRequisitions(): Promise<Requisition[]> {
+  const rows = await db.requisitions.toArray();
+  return rows.sort((a, b) => b.date.localeCompare(a.date));
+}
+
+export async function listRequisitionsByPlot(plotId: string): Promise<Requisition[]> {
+  const rows = await db.requisitions.where('plotId').equals(plotId).toArray();
+  return rows.sort((a, b) => b.date.localeCompare(a.date));
+}
+
+export async function listRequisitionsBySeedling(seedlingId: string): Promise<Requisition[]> {
+  const rows = await db.requisitions.where('seedlingId').equals(seedlingId).toArray();
+  return rows.sort((a, b) => b.date.localeCompare(a.date));
+}
+
+/**
+ * 登记批次退货（苗圃侧）：追加退货数量后重新核销领用并重算成活率。
+ * 返回该批次最新余量。
+ */
+export async function recordSeedlingReturn(seedlingId: string, addQuantity: number): Promise<number> {
+  let remaining = 0;
+  await db.transaction('rw', db.seedlings, db.requisitions, db.surveys, async (tx) => {
+    const seedling = (await tx.table('seedlings').get(seedlingId)) as Seedling | undefined;
+    if (!seedling) return;
+    const returned = Math.max(0, (seedling.returnedQuantity ?? 0) + addQuantity);
+    await tx.table('seedlings').update(seedlingId, { returnedQuantity: returned, updatedAt: nowIso() });
+    const affected = await reevaluateBatches(tx, [seedlingId]);
+    await recalcPlotSurvival(tx, affected);
+    const reqs = (await tx.table('requisitions').where('seedlingId').equals(seedlingId).toArray()) as Requisition[];
+    remaining = batchRemaining({ ...seedling, returnedQuantity: returned }, reqs);
+  });
+  return remaining;
+}
+
+/**
+ * 驳回挂起的领用（交人定）：驳回后该笔领用不再占用批次余量，
+ * 重新核销并重算相关地块成活率。
+ */
+export async function rejectRequisition(requisitionId: string): Promise<void> {
+  await db.transaction('rw', db.requisitions, db.seedlings, db.surveys, async (tx) => {
+    const req = (await tx.table('requisitions').get(requisitionId)) as Requisition | undefined;
+    if (!req || req.status !== '挂起') return;
+    await tx.table('requisitions').update(requisitionId, { status: '已驳回', updatedAt: nowIso() });
+    const affected = await reevaluateBatches(tx, [req.seedlingId]);
+    await recalcPlotSurvival(tx, affected);
+  });
+}
+
+/** 验收定稿 / 取消定稿；取消定稿时若存在待复算值则直接采用 */
+export async function setSurveyFinalized(surveyId: string, finalized: boolean): Promise<void> {
+  await db.transaction('rw', db.surveys, async (tx) => {
+    const survey = (await tx.table('surveys').get(surveyId)) as Survey | undefined;
+    if (!survey) return;
+    if (!finalized && survey.recalcRate !== null) {
+      await tx.table('surveys').update(surveyId, {
+        finalized: false,
+        survivalRate: survey.recalcRate,
+        recalcRate: null,
+        grade: survey.gradeManual ? survey.grade : rateLevel(survey.recalcRate),
+        updatedAt: nowIso(),
+      });
+    } else {
+      await tx.table('surveys').update(surveyId, { finalized, updatedAt: nowIso() });
+    }
+  });
+}
+
+/** 人工确认复算结论：把定稿验收的成活率改写为复算后的新口径值 */
+export async function confirmSurveyRecalc(surveyId: string): Promise<void> {
+  await db.transaction('rw', db.surveys, async (tx) => {
+    const survey = (await tx.table('surveys').get(surveyId)) as Survey | undefined;
+    if (!survey || survey.recalcRate === null) return;
+    await tx.table('surveys').update(surveyId, {
+      survivalRate: survey.recalcRate,
+      recalcRate: null,
+      grade: survey.gradeManual ? survey.grade : rateLevel(survey.recalcRate),
+      updatedAt: nowIso(),
+    });
+  });
 }
 
 /* ---------------------------- 整库快照 ---------------------------- */
@@ -287,16 +634,18 @@ export interface DatabaseSnapshot {
   plantings: Planting[];
   surveys: Survey[];
   replants: Replant[];
+  requisitions: Requisition[];
 }
 
 /** 导出整库快照 */
 export async function exportSnapshot(): Promise<DatabaseSnapshot> {
-  const [plots, seedlings, plantings, surveys, replants] = await Promise.all([
+  const [plots, seedlings, plantings, surveys, replants, requisitions] = await Promise.all([
     db.plots.toArray(),
     db.seedlings.toArray(),
     db.plantings.toArray(),
     db.surveys.toArray(),
     db.replants.toArray(),
+    db.requisitions.toArray(),
   ]);
   return {
     name: DB_NAME,
@@ -307,49 +656,67 @@ export async function exportSnapshot(): Promise<DatabaseSnapshot> {
     plantings,
     surveys,
     replants,
+    requisitions,
   };
 }
 
-/** 用快照覆盖整库（导入存档） */
+/** 用快照覆盖整库（导入存档）；缺领用登记时按现有栽植与补植回填 */
 export async function importSnapshot(snapshot: DatabaseSnapshot): Promise<void> {
-  await db.transaction('rw', db.plots, db.seedlings, db.plantings, db.surveys, db.replants, async () => {
-    await Promise.all([
-      db.plots.clear(),
-      db.seedlings.clear(),
-      db.plantings.clear(),
-      db.surveys.clear(),
-      db.replants.clear(),
-    ]);
-    await db.plots.bulkPut(snapshot.plots.map((row) => ({ ...row, revision: ROW_REVISION })));
-    await db.seedlings.bulkPut(snapshot.seedlings.map((row) => ({ ...row, revision: ROW_REVISION })));
-    await db.plantings.bulkPut(snapshot.plantings.map((row) => ({ ...row, revision: ROW_REVISION })));
-    await db.surveys.bulkPut(snapshot.surveys.map((row) => ({ ...row, revision: ROW_REVISION })));
-    await db.replants.bulkPut(snapshot.replants.map((row) => ({ ...row, revision: ROW_REVISION })));
-  });
+  await db.transaction(
+    'rw',
+    [db.plots, db.seedlings, db.plantings, db.surveys, db.replants, db.requisitions],
+    async (tx) => {
+      await Promise.all([
+        db.plots.clear(),
+        db.seedlings.clear(),
+        db.plantings.clear(),
+        db.surveys.clear(),
+        db.replants.clear(),
+        db.requisitions.clear(),
+      ]);
+      await db.plots.bulkPut(snapshot.plots.map((row) => ({ ...row, revision: ROW_REVISION })));
+      await db.seedlings.bulkPut(snapshot.seedlings.map((row) => ({ ...row, revision: ROW_REVISION })));
+      await db.plantings.bulkPut(snapshot.plantings.map((row) => ({ ...row, revision: ROW_REVISION })));
+      await db.surveys.bulkPut(snapshot.surveys.map((row) => ({ ...row, revision: ROW_REVISION })));
+      await db.replants.bulkPut(snapshot.replants.map((row) => ({ ...row, revision: ROW_REVISION })));
+      if (Array.isArray(snapshot.requisitions) && snapshot.requisitions.length > 0) {
+        await db.requisitions.bulkPut(snapshot.requisitions.map((row) => ({ ...row, revision: ROW_REVISION })));
+      } else {
+        // 旧存档没有领用登记：按现有栽植与补植回填
+        await backfillRequisitions(tx);
+      }
+    },
+  );
 }
 
 /** 清空全部数据并重新灌入演示数据 */
 export async function resetDatabase(): Promise<void> {
-  await db.transaction('rw', db.plots, db.seedlings, db.plantings, db.surveys, db.replants, async () => {
-    await Promise.all([
-      db.plots.clear(),
-      db.seedlings.clear(),
-      db.plantings.clear(),
-      db.surveys.clear(),
-      db.replants.clear(),
-    ]);
-  });
+  await db.transaction(
+    'rw',
+    [db.plots, db.seedlings, db.plantings, db.surveys, db.replants, db.requisitions],
+    async () => {
+      await Promise.all([
+        db.plots.clear(),
+        db.seedlings.clear(),
+        db.plantings.clear(),
+        db.surveys.clear(),
+        db.replants.clear(),
+        db.requisitions.clear(),
+      ]);
+    },
+  );
   await seedDatabase();
 }
 
 /** 各表行数统计 */
 export async function countAll(): Promise<Record<string, number>> {
-  const [plots, seedlings, plantings, surveys, replants] = await Promise.all([
+  const [plots, seedlings, plantings, surveys, replants, requisitions] = await Promise.all([
     db.plots.count(),
     db.seedlings.count(),
     db.plantings.count(),
     db.surveys.count(),
     db.replants.count(),
+    db.requisitions.count(),
   ]);
-  return { plots, seedlings, plantings, surveys, replants };
+  return { plots, seedlings, plantings, surveys, replants, requisitions };
 }

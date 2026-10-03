@@ -37,7 +37,7 @@ import StatBadge from '../components/common/StatBadge';
 import { useIdbTable } from '../hooks/useIdbTable';
 import { usePlotStore } from '../stores/plotStore';
 import { useSurveyStore } from '../stores/surveyStore';
-import { db } from '../utils/db';
+import { confirmSurveyRecalc, db, setSurveyFinalized } from '../utils/db';
 import { RATE_LEVEL_LABEL, RATE_LEVEL_OPTIONS, type RateLevel, type Survey } from '../types/survey';
 import { SURVIVAL_WARN_RATE, percentText } from '../utils/rate';
 
@@ -190,6 +190,21 @@ export default function SurveyBoard() {
     message.success(result);
   };
 
+  const handleToggleFinalized = async (record: Survey): Promise<void> => {
+    await setSurveyFinalized(record.id, !record.finalized);
+    message.success(
+      record.finalized
+        ? '已取消定稿，后续复算将自动改写成活率'
+        : '已定稿：批次数量变动时成活率挂起，等复算完成再认',
+    );
+  };
+
+  const handleConfirmRecalc = async (record: Survey): Promise<void> => {
+    if (record.recalcRate === null) return;
+    await confirmSurveyRecalc(record.id);
+    message.success(`已确认复算结论：成活率 ${record.recalcRate}%`);
+  };
+
   const columns: ColumnsType<Survey> = [
     {
       title: '地块',
@@ -272,11 +287,32 @@ export default function SurveyBoard() {
         record.gradeManual ? <Tag color="purple">人工复核</Tag> : <Tag>自动判定</Tag>,
     },
     {
+      title: '定稿 / 复算',
+      key: 'finalized',
+      width: 170,
+      render: (_value, record) => (
+        <Space direction="vertical" size={2}>
+          {record.finalized ? <Tag color="gold">已定稿</Tag> : <Tag>草稿</Tag>}
+          {record.recalcRate !== null ? (
+            <Tag color="orange">待复算 → {record.recalcRate}%</Tag>
+          ) : null}
+        </Space>
+      ),
+    },
+    {
       title: '操作',
       key: 'action',
-      width: 150,
+      width: 250,
       render: (_value, record) => (
-        <Space size={4}>
+        <Space size={4} wrap>
+          {record.recalcRate !== null ? (
+            <Button size="small" type="link" onClick={() => void handleConfirmRecalc(record)}>
+              确认复算为 {record.recalcRate}%
+            </Button>
+          ) : null}
+          <Button size="small" type="link" onClick={() => void handleToggleFinalized(record)}>
+            {record.finalized ? '取消定稿' : '定稿'}
+          </Button>
           <Button size="small" type="link" icon={<EditOutlined />} onClick={() => openEdit(record)}>
             编辑
           </Button>
@@ -304,6 +340,8 @@ export default function SurveyBoard() {
     const stat = statOf(plot.id);
     return stat.surveyCount > 0 && stat.latestRate < SURVIVAL_WARN_RATE;
   });
+
+  const pendingRecalcSurveys = rows.filter((row) => row.recalcRate !== null);
 
   return (
     <div>
@@ -339,6 +377,25 @@ export default function SurveyBoard() {
                 <span key={plot.id}>
                   {plot.name}：最新成活率 {percentText(statOf(plot.id).latestRate)}，建议补植{' '}
                   {statOf(plot.id).suggestReplant} 株
+                </span>
+              ))}
+            </Space>
+          }
+        />
+      ) : null}
+
+      {pendingRecalcSurveys.length > 0 ? (
+        <Alert
+          type="info"
+          showIcon
+          style={{ marginBottom: 14 }}
+          message={`有 ${pendingRecalcSurveys.length} 条定稿验收结论待复算确认`}
+          description={
+            <Space direction="vertical" size={2}>
+              {pendingRecalcSurveys.map((row) => (
+                <span key={row.id}>
+                  {plotName(row.plotId)} · 第 {row.round} 测次：原定稿成活率 {row.survivalRate}%，批次数量变动后复算为{' '}
+                  {row.recalcRate}%，请在列表中确认复算结论。
                 </span>
               ))}
             </Space>

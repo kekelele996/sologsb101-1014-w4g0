@@ -30,7 +30,7 @@ import FilterBar from '../components/common/FilterBar';
 import StatBadge from '../components/common/StatBadge';
 import { useIdbTable } from '../hooks/useIdbTable';
 import { usePlotStore } from '../stores/plotStore';
-import { db } from '../utils/db';
+import { db, deletePlantingWithRequisition, savePlantingWithRequisition } from '../utils/db';
 import type { Planting } from '../types/planting';
 import type { Seedling } from '../types/seedling';
 import { ROUTES } from '../router';
@@ -66,7 +66,8 @@ export default function PlantingEntry() {
   const plot = usePlotStore((state) => state.plots.find((item) => item.id === id));
 
   const seedlingTable = useIdbTable<Seedling>(db.seedlings, { sortByUpdatedAt: false });
-  const { rows, loading, create, update, remove } = useIdbTable<Planting>(db.plantings, { sortByUpdatedAt: false });
+  const { rows, loading } = useIdbTable<Planting>(db.plantings, { sortByUpdatedAt: false });
+  const batchRemainingOf = usePlotStore((state) => state.batchRemainingOf);
 
   const [keyword, setKeyword] = useState('');
   const [operatorFilter, setOperatorFilter] = useState('all');
@@ -75,6 +76,10 @@ export default function PlantingEntry() {
   const [submitting, setSubmitting] = useState(false);
   const [density, setDensity] = useState<DensityCheck | null>(null);
   const [form] = Form.useForm<PlantingFormValues>();
+  const watchedSeedlingId = Form.useWatch('seedlingId', form);
+  const watchedCount = Form.useWatch('count', form);
+  const watchedRemaining = watchedSeedlingId ? batchRemainingOf(watchedSeedlingId) : 0;
+  const willPending = watchedSeedlingId !== undefined && watchedCount > watchedRemaining;
 
   const plotSeedlings = useMemo(
     () => seedlingTable.rows.filter((row) => row.plotId === id),
@@ -160,12 +165,22 @@ export default function PlantingEntry() {
         count: values.count,
         operator: values.operator.trim(),
       };
+      const row: Planting = {
+        id: editing === null ? `planting-${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}` : editing.id,
+        ...payload,
+        createdAt: editing === null ? new Date().toISOString() : editing.createdAt,
+        updatedAt: new Date().toISOString(),
+        revision: 3,
+      };
+      const result = await savePlantingWithRequisition(row);
       if (editing === null) {
-        await create(payload, 'planting');
-        message.success(`已登记栽植 ${payload.count} 株`);
+        if (result.status === '已扣') {
+          message.success(`已登记栽植 ${payload.count} 株，领用已从批次余量扣除`);
+        } else {
+          message.warning(`已登记栽植 ${payload.count} 株，但超出批次余量，领用已挂起交人定`, 6);
+        }
       } else {
-        await update(editing.id, payload);
-        message.success('栽植记录已更新');
+        message.success('栽植记录已更新，领用已重新核销');
       }
       const check = plot === undefined ? null : checkDensity(plot.areaMu, payload.spacingM, payload.count);
       if (check !== null && !check.ok) {
@@ -273,8 +288,8 @@ export default function PlantingEntry() {
             okButtonProps={{ danger: true }}
             cancelText="取消"
             onConfirm={async () => {
-              await remove(record.id);
-              message.success('栽植记录已删除');
+              await deletePlantingWithRequisition(record.id);
+              message.success('栽植记录已删除，领用已清理');
             }}
           >
             <Button size="small" type="link" danger icon={<DeleteOutlined />}>
@@ -397,10 +412,14 @@ export default function PlantingEntry() {
           <Form.Item name="seedlingId" label="苗木批次" rules={[{ required: true, message: '请选择苗木批次' }]}>
             <Select
               placeholder="选择该地块下的苗木批次"
-              options={plotSeedlings.map((row) => ({
-                value: row.id,
-                label: `${row.species} · ${row.spec} · ${row.quantity} 株（${row.source}）`,
-              }))}
+              options={plotSeedlings.map((row) => {
+                const remaining = batchRemainingOf(row.id);
+                return {
+                  value: row.id,
+                  label: `${row.species} · ${row.spec} · 余量 ${remaining.toLocaleString('zh-CN')} 株（${row.source}）`,
+                  disabled: remaining <= 0,
+                };
+              })}
             />
           </Form.Item>
           <Space size={12} style={{ display: 'flex' }}>
@@ -441,6 +460,16 @@ export default function PlantingEntry() {
               填写株距与株数后会自动校验密度（合理区间 {DENSITY_MIN_M2_PER_PLANT}–{DENSITY_MAX_M2_PER_PLANT} ㎡/株）。
             </Typography.Text>
           )}
+
+          {willPending ? (
+            <Alert
+              type="warning"
+              showIcon
+              style={{ marginTop: 8 }}
+              message="该笔领用将超出批次余量，会挂起交人定"
+              description={`所选批次当前余量 ${watchedRemaining.toLocaleString('zh-CN')} 株，本次领用 ${watchedCount.toLocaleString('zh-CN')} 株，超出 ${(watchedCount - watchedRemaining).toLocaleString('zh-CN')} 株。保存后领用状态为「挂起」，由苗圃登记退货或调整批次数量后自动核销，也可驳回。`}
+            />
+          ) : null}
         </Form>
       </Modal>
     </div>

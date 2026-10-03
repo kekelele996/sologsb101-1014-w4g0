@@ -3,7 +3,7 @@
  * 父 → 子 → 孙三层链路：地块 → 苗木批次 / 栽植 → 验收 → 补植
  * 所有 id 固定，保证 /plots/:id/seedlings、/plots/:id/plantings 深链一定命中真实数据。
  */
-import { db, ROW_REVISION } from './db';
+import { db, ROW_REVISION, backfillRequisitions } from './db';
 import type { Plot } from '../types/plot';
 import type { Seedling } from '../types/seedling';
 import type { Planting } from '../types/planting';
@@ -24,21 +24,34 @@ function plotRow(row: Omit<Plot, 'createdAt' | 'updatedAt' | 'revision'>): Plot 
   return { ...row, createdAt: SEED_TIME, updatedAt: SEED_TIME, revision: ROW_REVISION };
 }
 
-function seedlingRow(row: Omit<Seedling, 'createdAt' | 'updatedAt' | 'revision'>): Seedling {
-  return { ...row, createdAt: SEED_TIME, updatedAt: SEED_TIME, revision: ROW_REVISION };
+function seedlingRow(
+  row: Omit<Seedling, 'createdAt' | 'updatedAt' | 'revision' | 'returnedQuantity'> & { returnedQuantity?: number },
+): Seedling {
+  return {
+    ...row,
+    returnedQuantity: row.returnedQuantity ?? 0,
+    createdAt: SEED_TIME,
+    updatedAt: SEED_TIME,
+    revision: ROW_REVISION,
+  };
 }
 
 function plantingRow(row: Omit<Planting, 'createdAt' | 'updatedAt' | 'revision'>): Planting {
   return { ...row, createdAt: SEED_TIME, updatedAt: SEED_TIME, revision: ROW_REVISION };
 }
 
-function surveyRow(row: Omit<Survey, 'createdAt' | 'updatedAt' | 'revision' | 'grade' | 'gradeManual' | 'survivalRate'>, total: number): Survey {
+function surveyRow(
+  row: Omit<Survey, 'createdAt' | 'updatedAt' | 'revision' | 'grade' | 'gradeManual' | 'survivalRate' | 'finalized' | 'recalcRate'>,
+  total: number,
+): Survey {
   const survivalRate = calcSurvivalRate(row.aliveCount, total);
   return {
     ...row,
     survivalRate,
     grade: rateLevel(survivalRate),
     gradeManual: false,
+    finalized: false,
+    recalcRate: null,
     createdAt: SEED_TIME,
     updatedAt: SEED_TIME,
     revision: ROW_REVISION,
@@ -139,11 +152,13 @@ export async function seedDatabase(): Promise<void> {
     replantRow({ id: 'replant-c1', plotId: SEED_IDS.plotC, missingCount: 560, planDate: '2024-11-05', species: '无瓣海桑', state: '已复核' }),
   ];
 
-  await db.transaction('rw', db.plots, db.seedlings, db.plantings, db.surveys, db.replants, async () => {
+  await db.transaction('rw', [db.plots, db.seedlings, db.plantings, db.surveys, db.replants, db.requisitions], async (tx) => {
     await db.plots.bulkPut(plots);
     await db.seedlings.bulkPut(seedlings);
     await db.plantings.bulkPut(plantings);
     await db.surveys.bulkPut(surveys);
     await db.replants.bulkPut(replants);
+    // 按现有栽植与补植回填领用登记（演示数据同样走「班组领用、批次核销」口径）
+    await backfillRequisitions(tx);
   });
 }

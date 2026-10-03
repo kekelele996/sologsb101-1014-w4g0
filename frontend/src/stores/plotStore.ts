@@ -9,9 +9,11 @@ import type { Plot, PlotDraft, Substrate, TideZone } from '../types/plot';
 import type { Seedling } from '../types/seedling';
 import type { Planting } from '../types/planting';
 import type { Survey, RateLevel } from '../types/survey';
+import type { Requisition } from '../types/requisition';
 import {
   DB_SCHEMA_VERSION,
   ROW_REVISION,
+  batchRemaining,
   countAll,
   db,
   initDatabase,
@@ -74,6 +76,7 @@ interface PlotStoreState {
   seedlings: Seedling[];
   plantings: Planting[];
   surveys: Survey[];
+  requisitions: Requisition[];
   currentPlotId: string | null;
   loading: boolean;
   ready: boolean;
@@ -93,6 +96,10 @@ interface PlotStoreState {
   visiblePlots: () => Plot[];
   statOf: (plotId: string) => PlotStat;
   summaryOf: (plotId: string | null) => SurvivalSummary;
+  /** 某批次当前余量 = 进场 - 退货 - 已扣领用合计 */
+  batchRemainingOf: (seedlingId: string) => number;
+  /** 某地块当前挂起（扣不下）的领用单数 */
+  pendingCountOf: (plotId: string) => number;
   refreshCounts: () => Promise<void>;
 }
 
@@ -114,6 +121,7 @@ export const usePlotStore = create<PlotStoreState>((set, get) => ({
   seedlings: [],
   plantings: [],
   surveys: [],
+  requisitions: [],
   currentPlotId: readCurrentPlotId(),
   loading: true,
   ready: false,
@@ -130,20 +138,21 @@ export const usePlotStore = create<PlotStoreState>((set, get) => ({
       if (!subscribed) {
         subscribed = true;
         liveQuery(async () => {
-          const [plots, seedlings, plantings, surveys] = await Promise.all([
+          const [plots, seedlings, plantings, surveys, requisitions] = await Promise.all([
             db.plots.toArray(),
             db.seedlings.toArray(),
             db.plantings.toArray(),
             db.surveys.toArray(),
+            db.requisitions.toArray(),
           ]);
-          return { plots, seedlings, plantings, surveys };
+          return { plots, seedlings, plantings, surveys, requisitions };
         }).subscribe({
-          next: ({ plots, seedlings, plantings, surveys }) => {
+          next: ({ plots, seedlings, plantings, surveys, requisitions }) => {
             const stats: Record<string, PlotStat> = {};
             const summaries: Record<string, SurvivalSummary> = {};
             plots.forEach((plot) => {
               const plotSeedlings = seedlings.filter((row) => row.plotId === plot.id);
-              const summary = buildSurvivalSummary(plot.id, surveys, plantings);
+              const summary = buildSurvivalSummary(plot.id, surveys, plantings, undefined, requisitions);
               summaries[plot.id] = summary;
               stats[plot.id] = {
                 plotId: plot.id,
@@ -165,6 +174,7 @@ export const usePlotStore = create<PlotStoreState>((set, get) => ({
               seedlings,
               plantings,
               surveys,
+              requisitions,
               stats,
               summaries,
               loading: false,
@@ -266,6 +276,19 @@ export const usePlotStore = create<PlotStoreState>((set, get) => ({
   summaryOf(plotId) {
     if (plotId === null) return buildSurvivalSummary('', [], []);
     return get().summaries[plotId] ?? buildSurvivalSummary(plotId, [], []);
+  },
+
+  batchRemainingOf(seedlingId) {
+    const seedling = get().seedlings.find((row) => row.id === seedlingId);
+    if (!seedling) return 0;
+    return batchRemaining(
+      seedling,
+      get().requisitions.filter((row) => row.seedlingId === seedlingId),
+    );
+  },
+
+  pendingCountOf(plotId) {
+    return get().requisitions.filter((row) => row.plotId === plotId && row.status === '挂起').length;
   },
 
   async refreshCounts() {

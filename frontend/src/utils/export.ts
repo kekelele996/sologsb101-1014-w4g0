@@ -73,6 +73,10 @@ export function parseSnapshot(text: string): SnapshotParseResult {
       return { ok: false, message: `存档缺少 ${String(key)} 数组。`, snapshot: null };
     }
   }
+  // 领用登记为 v3 新增：旧存档缺该数组时由导入流程按栽植与补植回填
+  if (data.requisitions !== undefined && !Array.isArray(data.requisitions)) {
+    return { ok: false, message: '存档 requisitions 字段必须是数组。', snapshot: null };
+  }
   return { ok: true, message: '存档校验通过。', snapshot: data as DatabaseSnapshot };
 }
 

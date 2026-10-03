@@ -42,7 +42,7 @@ docker compose up -d --build       # 改完代码后重新构建
 | 构建 | Vite 5 | 开发端口与宿主端口一致（22814） |
 | 路由 | React Router 6 | `createBrowserRouter` + 路由懒加载 |
 | 状态管理 | Zustand 4 | 跨页状态集中在 store，页面只读 store |
-| 本地持久化 | Dexie 4（IndexedDB） | 库名 `gbmangrove`，含 v1 → v2 升级迁移 |
+| 本地持久化 | Dexie 4（IndexedDB） | 库名 `gbmangrove`，含 v1 → v2 → v3 升级迁移 |
 | 时间处理 | dayjs | |
 | 容器 | node:20-alpine → nginx:alpine | 多阶段构建，`chmod -R a+rX` 规避静态资源 403 |
 
@@ -69,7 +69,7 @@ sologsb101-1014/
         ├── main.tsx            # 入口：ConfigProvider + RouterProvider
         ├── App.tsx             # 外壳：侧边导航 + 当前地块上下文 + 数据库初始化
         ├── styles/main.css
-        ├── types/              # plot.ts seedling.ts planting.ts survey.ts replant.ts
+        ├── types/              # plot.ts seedling.ts planting.ts survey.ts replant.ts requisition.ts
         ├── stores/             # plotStore.ts surveyStore.ts replantStore.ts
         ├── components/common/  # RateTag.tsx FilterBar.tsx StatBadge.tsx EmptyPanel.tsx
         ├── hooks/              # useSurvivalRate.ts useIdbTable.ts
@@ -100,20 +100,19 @@ sologsb101-1014/
 
 * **持久化方案**：IndexedDB，通过 Dexie 封装（`src/utils/db.ts`）。
 * **数据库名**：`gbmangrove`。
-* **数据结构版本**：`DB_SCHEMA_VERSION = 2`，`version(1)` 建立全部表，`version(2)` 补齐索引并执行 `.upgrade()` 迁移：
-  * 为 `plots` 增加 `updatedAt`、`surveys` 增加 `[plotId+round]` 复合索引、`plantings` 增加 `spacingM` 索引等；
-  * 回填 `revision` / `createdAt` / `updatedAt`；
-  * 为 `plots` 补齐 `missingCount`、`lastReplantDate` 回写字段；
-  * 为 `surveys` 补齐 `grade`、`gradeManual` 字段（按 `survivalRate` 自动判定等级）。
+* **数据结构版本**：`DB_SCHEMA_VERSION = 3`，`version(1)` 建立全部表，`version(2)` 补齐索引并迁移，`version(3)` 增加领用登记并执行 `.upgrade()` 迁移：
+  * v2：为 `plots` 增加 `updatedAt`、`surveys` 增加 `[plotId+round]` 复合索引、`plantings` 增加 `spacingM` 索引等；回填 `revision` / `createdAt` / `updatedAt`；为 `plots` 补齐 `missingCount`、`lastReplantDate`；为 `surveys` 补齐 `grade`、`gradeManual`。
+  * v3：新增 `requisitions` 领用表；为 `seedlings` 补 `returnedQuantity`（退货数量）、`surveys` 补 `finalized`（定稿）与 `recalcRate`（待复算成活率）；并**按现有栽植与补植回填领用登记**（旧数据原本没有领用记录）。
 * **表结构**：
 
   | 表 | 主键 | 主要索引 |
   | --- | --- | --- |
   | `plots` | id | name, tideZone, substrate, restoreMode, state, createdAt, updatedAt |
-  | `seedlings` | id | plotId, species, source, arrivalDate, quantity |
+  | `seedlings` | id | plotId, species, source, arrivalDate, quantity, returnedQuantity |
   | `plantings` | id | plotId, seedlingId, plantDate, spacingM |
-  | `surveys` | id | plotId, [plotId+round], date, grade |
+  | `surveys` | id | plotId, [plotId+round], date, grade, finalized |
   | `replants` | id | plotId, planDate, state, species |
+  | `requisitions` | id | plotId, seedlingId, kind, status, date, refId |
 
 * **首屏演示数据**：`initDatabase()` 在打开数据库后检测 `plots` 表是否为空，为空则调用 `utils/seed.ts` 播种，
   幂等且只执行一次。播种链路为 **地块 → 苗木批次 → 栽植 → 验收 → 补植** 三层互相引用：
@@ -147,8 +146,18 @@ npm run preview      # 预览 dist 产物
 
 ## 七、核心业务规则
 
-* **成活率** = 成活株数 ÷ 该地块栽植总株数 × 100%（`src/utils/rate.ts` 统一口径）。
+* **成活率** = 成活株数 ÷ 该地块**已扣栽植领用**合计 × 100%（`src/utils/rate.ts` 统一口径）。
+  栽植总株数以「已扣领用」为准：班组领用、批次核销，扣不下的挂起、不计入栽植总株数。
 * **成活率等级**：≥ 85% 优，70%–85% 良，50%–70% 一般，< 50% 差；低于 50% 视为告警，建议生成补植计划。
 * **密度合理性**：平均单株占地面积需落在 0.6–12 ㎡/株；过密/过疏都会在栽植记录页给出提示。
-* **补植回写**：补植状态推进到「已补植」时，自动扣减地块缺株数、写入最近补植日期，
+* **补植回写**：补植状态推进到「已补植 / 已复核」时，自动生成「补植领用」、扣减地块缺株数、写入最近补植日期，
   并按「原成活株数 + 本次补植株数」重算最新一次验收的成活率。
+* **两边各管各的**：
+  * **苗圃管批次**：进场数量、退货数量与余量（余量 = 进场 − 退货 − 已扣领用）；
+  * **班组管领用**：栽植领用与补植领用都从批次余量里扣，一条栽植记录对应一笔「栽植领用」，
+    一笔补植完成对应一笔「补植领用」。
+* **扣不下先挂起**：领用数量超出批次余量时状态置为「挂起」交人定；苗圃追加进场数量或登记退货后按 FIFO
+  自动重新核销，也可直接「驳回」该笔领用。
+* **批次数量一改、成活率就重算**：批次进场 / 退货数量变动后，按 FIFO 重新核销领用并重算相关地块成活率。
+* **定稿验收等复算**：验收可「定稿」。批次数量变动触发复算时，**非定稿**验收自动改写成活率，
+  **定稿**验收不立即改写，把复算结果挂起（`recalcRate`），等人工「确认复算」后再认。
